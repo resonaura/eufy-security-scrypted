@@ -1017,6 +1017,148 @@ describe("StreamServer", () => {
       await s.stop();
     });
 
+    it("can start a new viewer after an idle stream loses its slot", async () => {
+      const { mockWsClient, startLivestream } = makeWs();
+      let revoke: (() => void) | undefined;
+      const acquireStreamSlot = jest.fn(
+        (_priority: string, onRevoke: () => void) => {
+          revoke = onRevoke;
+          return {
+            active: true,
+            release: jest.fn(),
+            markDelivering: jest.fn(),
+            whenReady: Promise.resolve(),
+          };
+        },
+      );
+      const s = new StreamServer({
+        port: 0,
+        host: "127.0.0.1",
+        wsClient: mockWsClient as any,
+        serialNumber: "TEST123",
+        acquireStreamSlot,
+      });
+      const sockets: net.Socket[] = [];
+      try {
+        await s.start();
+        const first = net.createConnection({
+          port: s.getPort(),
+          host: "127.0.0.1",
+        });
+        sockets.push(first);
+        await new Promise<void>((resolve) => first.once("connect", resolve));
+        await wait(30);
+        const video = mockWsClient.addEventListener.mock.calls.find(
+          (call: any[]) => call[0] === "livestream video data",
+        )![1] as (event: any) => void;
+        video({
+          serialNumber: "TEST123",
+          buffer: { data: createTestH264Data() },
+          metadata: {
+            videoCodec: "H264",
+            videoFPS: 15,
+            videoWidth: 1920,
+            videoHeight: 1080,
+          },
+        });
+        first.destroy();
+        await wait(30);
+        expect((s as any).getTotalConsumers()).toBe(0);
+        expect(startLivestream).toHaveBeenCalledTimes(1);
+
+        // The stream lingers after its viewer leaves; another camera takes
+        // its slot before the idle monitor has stopped it.
+        revoke!();
+        await wait(30);
+        const next = net.createConnection({
+          port: s.getPort(),
+          host: "127.0.0.1",
+        });
+        sockets.push(next);
+        await new Promise<void>((resolve) => next.once("connect", resolve));
+        await wait(30);
+        expect(acquireStreamSlot).toHaveBeenCalledTimes(2);
+        expect(startLivestream).toHaveBeenCalledTimes(2);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await s.stop();
+      }
+    });
+
+    it("waits for revoked stream teardown before granting an arriving viewer", async () => {
+      const { mockWsClient, startLivestream } = makeWs();
+      const oldRelease = jest.fn();
+      const newRelease = jest.fn();
+      let finishStop!: () => void;
+      const stop = new Promise<void>((resolve) => {
+        finishStop = resolve;
+      });
+      mockWsClient.commands
+        .device()
+        .isLivestreaming.mockResolvedValue({ livestreaming: true });
+      mockWsClient.commands.device().stopLivestream.mockReturnValue(stop);
+      const acquireStreamSlot = jest.fn().mockReturnValue({
+        active: true,
+        release: newRelease,
+        markDelivering: jest.fn(),
+        whenReady: Promise.resolve(),
+      });
+      const s = new StreamServer({
+        port: 0,
+        wsClient: mockWsClient as any,
+        serialNumber: "TEST123",
+        acquireStreamSlot,
+      });
+      (s as any).streamLease = { active: false, release: oldRelease };
+      (s as any).livestreamIntendedState = true;
+      try {
+        (s as any).handleSlotRevoked();
+        await wait(0); // stop is now in flight
+        (s as any).metadataBootstrapConsumers = 1;
+        const attach = (s as any).updateLivestreamStateForMuxerClients();
+        await wait(0);
+        expect(acquireStreamSlot).not.toHaveBeenCalled();
+        expect(startLivestream).not.toHaveBeenCalled();
+        mockWsClient.commands
+          .device()
+          .isLivestreaming.mockResolvedValue({ livestreaming: false });
+        finishStop();
+        await attach;
+        await wait(0);
+        expect(oldRelease).toHaveBeenCalledTimes(1);
+        expect(acquireStreamSlot).toHaveBeenCalledTimes(1);
+        expect(startLivestream).toHaveBeenCalledTimes(1);
+        expect(newRelease).not.toHaveBeenCalled();
+      } finally {
+        finishStop();
+        await wait(0);
+        (s as any).metadataBootstrapConsumers = 0;
+        (s as any).stopActivityMonitoring();
+        if ((s as any).startStopTimeout)
+          clearTimeout((s as any).startStopTimeout);
+      }
+    });
+
+    it("clears a stale revoke when the idle monitor finds no consumers", async () => {
+      jest.useFakeTimers();
+      const { mockWsClient } = makeWs();
+      const s = new StreamServer({
+        port: 0,
+        wsClient: mockWsClient as any,
+        serialNumber: "TEST123",
+      });
+      try {
+        (s as any).slotRevoked = true;
+        (s as any).lastClientActivity = Date.now() - 13000;
+        (s as any).startActivityMonitoring();
+        await jest.advanceTimersByTimeAsync(5000);
+        expect((s as any).slotRevoked).toBe(false);
+      } finally {
+        (s as any).stopActivityMonitoring();
+        jest.useRealTimers();
+      }
+    });
+
     it("on revoke, stops the livestream BEFORE releasing the slot (clean staggered handoff)", async () => {
       const order: string[] = [];
       let started = false;
@@ -2385,6 +2527,152 @@ describe("StreamServer", () => {
     });
   });
 
+  describe("muxer priming with cached parameter sets", () => {
+    const START = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+    const SPS_NAL = Buffer.from([0x67, 0x42, 0x00, 0x1e]);
+    const PPS_NAL = Buffer.from([0x68, 0xce, 0x3c, 0x80]);
+    const IDR_NAL = Buffer.from([0x65, 0xaa, 0xaa, 0xaa, 0xaa]);
+
+    const nalTypes = (buf: Buffer, hevc = false): number[] => {
+      const types: number[] = [];
+      let i = 0;
+      while (i < buf.length) {
+        const sc = buf.indexOf(START, i);
+        if (sc < 0) break;
+        const header = sc + START.length;
+        if (header >= buf.length) break;
+        types.push(hevc ? (buf[header] >> 1) & 0x3f : buf[header] & 0x1f);
+        i = header + 1;
+      }
+      return types;
+    };
+
+    const fireVideo = (data: Buffer, videoCodec = "H264", videoFPS = 30) => {
+      const handler = mockWsClient.addEventListener.mock.calls.find(
+        (c: any[]) => c[0] === "livestream video data",
+      )[1];
+      handler({
+        serialNumber: "TEST_DEVICE_123",
+        buffer: { data },
+        metadata: {
+          videoCodec,
+          videoFPS,
+          videoWidth: 1920,
+          videoHeight: 1080,
+        },
+      });
+    };
+
+    // Connect a muxed client and let it graduate to an active muxer. The
+    // connect starts a fresh metadata session (clearing stale audio state), so
+    // audio capability is re-declared afterwards to skip the 2.5s audio probe.
+    const attachMuxer = async () => {
+      await server.start();
+      const socket = net.createConnection({
+        port: server.getMuxedPort()!,
+        host: "127.0.0.1",
+      });
+      await new Promise((resolve) => socket.on("connect", resolve));
+      await wait(0);
+      (server as any).deliversAudio = true;
+      return socket;
+    };
+
+    const lastMuxer = () => {
+      const JMuxerMock = require("jmuxer").default;
+      return JMuxerMock.mock.results[JMuxerMock.mock.results.length - 1].value;
+    };
+
+    it("primes a new H.264 muxer with the cached SPS/PPS (never the stale IDR)", async () => {
+      const socket = await attachMuxer();
+
+      // Eufy bundles the parameter sets with the keyframe. This frame is what
+      // populates the cache — and it is NOT fanned out to the muxer, which is
+      // only constructed once this event has been processed.
+      fireVideo(
+        Buffer.concat([START, SPS_NAL, START, PPS_NAL, START, IDR_NAL]),
+      );
+      await wait(50);
+
+      const muxer = lastMuxer();
+      const feeds = muxer.feed.mock.calls.map((c: any[]) => c[0]);
+      const primed = feeds.filter((f: any) => f.video);
+
+      expect(primed).toHaveLength(1);
+      // Parameter sets only: a stale keyframe ahead of the live stream would
+      // make ffmpeg decode an old picture first.
+      expect(nalTypes(primed[0].video)).toEqual([7, 8]);
+      expect(primed[0].video.includes(IDR_NAL)).toBe(false);
+
+      socket.destroy();
+    });
+
+    it("primes an H.265 muxer with VPS→SPS→PPS in decoder order", async () => {
+      const socket = await attachMuxer();
+
+      fireVideo(createTestHevcData(), "H265");
+      await wait(50);
+
+      const muxer = lastMuxer();
+      const primed = muxer.feed.mock.calls
+        .map((c: any[]) => c[0])
+        .filter((f: any) => f.video);
+
+      expect(primed).toHaveLength(1);
+      expect(nalTypes(primed[0].video, true)).toEqual([32, 33, 34]);
+
+      socket.destroy();
+    });
+
+    it("does not prime a muxer when no parameter sets are cached", async () => {
+      const socket = await attachMuxer();
+
+      // IDR-only event: no SPS/PPS to cache, so there is nothing to prime with.
+      fireVideo(Buffer.concat([START, IDR_NAL]));
+      await wait(50);
+
+      expect(lastMuxer().feed).not.toHaveBeenCalled();
+
+      socket.destroy();
+    });
+
+    it("uses the fallback fps when the camera reports 0 (JMuxer would use 30)", async () => {
+      const socket = await attachMuxer();
+
+      fireVideo(
+        Buffer.concat([START, SPS_NAL, START, PPS_NAL, START, IDR_NAL]),
+        "H264",
+        0,
+      );
+      await wait(50);
+
+      const JMuxerMock = require("jmuxer").default;
+      const options =
+        JMuxerMock.mock.calls[JMuxerMock.mock.calls.length - 1][0];
+      expect(options.fps).toBe(15);
+
+      socket.destroy();
+    });
+
+    it("keeps a reported fps when the camera advertises one", async () => {
+      const socket = await attachMuxer();
+
+      fireVideo(
+        Buffer.concat([START, SPS_NAL, START, PPS_NAL, START, IDR_NAL]),
+        "H264",
+        24,
+      );
+      await wait(50);
+
+      const JMuxerMock = require("jmuxer").default;
+      const options =
+        JMuxerMock.mock.calls[JMuxerMock.mock.calls.length - 1][0];
+      expect(options.fps).toBe(24);
+
+      socket.destroy();
+    });
+  });
+
   describe("parameter-set caching (individual NAL units, not whole events)", () => {
     const START = Buffer.from([0x00, 0x00, 0x00, 0x01]);
     const SPS_NAL = Buffer.from([0x67, 0x42, 0x00, 0x1e]);
@@ -2494,6 +2782,57 @@ describe("StreamServer", () => {
 
       expect(deviceApi.stopLivestream).toHaveBeenCalled();
       socket.destroy();
+    });
+  });
+
+  describe("livestream state-desync error handling", () => {
+    it("treats device_livestream_already_running on start as success (no retry churn / no wedge)", async () => {
+      // The pre-flight isLivestreaming() check can return a stale "false"
+      // while the server actually has the stream running; startLivestream then
+      // rejects with "already running". That must be treated as success (the
+      // stream we want IS up) — not retried, which would churn the HomeBase's
+      // single P2P slot and escalate to a spurious wedge/recycle.
+      jest.useFakeTimers();
+      const startLivestream = jest
+        .fn()
+        .mockRejectedValue(
+          new Error("Command failed: device_livestream_already_running"),
+        );
+      const deviceApi = {
+        startLivestream,
+        stopLivestream: jest.fn().mockResolvedValue({}),
+        isLivestreaming: jest.fn().mockResolvedValue({ livestreaming: false }),
+      };
+      const wsClient = {
+        addEventListener: jest.fn().mockReturnValue(() => {}),
+        commands: { device: jest.fn().mockReturnValue(deviceApi) },
+      };
+      const s = new StreamServer({
+        port: testPort,
+        host: "127.0.0.1",
+        wsClient: wsClient as any,
+        serialNumber: "TEST123",
+      });
+      const streamErrors: unknown[] = [];
+      const wedges: unknown[] = [];
+      s.on("streamError", (e) => streamErrors.push(e));
+      s.on("upstreamWedged", (e) => wedges.push(e));
+
+      // Drive ensureLivestreamState directly (no TCP server needed).
+      (s as any).livestreamIntendedState = true;
+      const p = (s as any).ensureLivestreamState();
+      // Fast-forward well past the retry window (retryDelay 5s × 2).
+      await jest.advanceTimersByTimeAsync(12000);
+      await p;
+
+      // Exactly one start attempt, no failure escalation, session anchored so
+      // the mid-session wedge watchdog can still fire if no data arrives.
+      expect(startLivestream).toHaveBeenCalledTimes(1);
+      expect(streamErrors).toHaveLength(0);
+      expect(wedges).toHaveLength(0);
+      expect((s as any).livestreamSessionStartedAt).toBeGreaterThan(0);
+
+      jest.useRealTimers();
     });
   });
 });

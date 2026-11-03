@@ -87,6 +87,7 @@ import {
   StateChangeEvent,
 } from "./services/device";
 import { CompatibilityMode } from "./services/device/stream-selector";
+import { DirectRtspService } from "./services/device/direct-rtsp-service";
 import { PropertyMapper } from "./utils/property-mapper";
 import {
   acquireStationSlot,
@@ -205,6 +206,7 @@ export class EufyDevice
   private videoClipsService!: VideoClipsService;
   private snapshotService!: SnapshotService;
   private streamService!: StreamService;
+  private directRtspService!: DirectRtspService;
   private ptzControlService!: PtzControlService;
   private lightControlService!: LightControlService;
 
@@ -335,6 +337,12 @@ export class EufyDevice
       this.logger,
       { compatibilityMode: () => this.getCompatibilityMode() },
     );
+    this.directRtspService = new DirectRtspService({
+      api: () => this.api,
+      requiresActivation: () => !!this.latestProperties?.rtspStream,
+      ffmpegPath: () => sdk.mediaManager.getFFmpegPath(),
+      logger: this.logger,
+    });
     this.ptzControlService = new PtzControlService(
       deviceApi,
       () => this.latestProperties?.type,
@@ -720,7 +728,7 @@ export class EufyDevice
       const rtspOption: ResponseMediaStreamOptions = {
         id: "rtsp",
         name: "RTSP Stream (Direct)",
-        container: "rtsp",
+        container: this.latestProperties?.rtspStream ? "mpegts" : "rtsp",
         tool: "ffmpeg",
         video: { codec: "h264", width, height },
         audio: { codec: "aac" },
@@ -733,7 +741,7 @@ export class EufyDevice
 
   /**
    * Get video stream using Direct RTSP or StreamService
-   * Direct RTSP provides zero-latency, high-resolution streaming with native AAC audio.
+   * Direct RTSP uses the local camera feed with native AAC audio.
    */
   async getVideoStream(
     options?: RequestMediaStreamOptions,
@@ -746,15 +754,6 @@ export class EufyDevice
       this.logger.info(
         `[stream-request] Streaming via Direct RTSP: ${sanitized}`,
       );
-
-      // Wake/start RTSP livestream if device requires a trigger (e.g. battery cameras)
-      if (this.latestProperties?.rtspStream && this.api.startRtspLivestream) {
-        try {
-          await this.api.startRtspLivestream();
-        } catch (e) {
-          this.logger.debug(`startRtspLivestream notification: ${e}`);
-        }
-      }
 
       const quality = this.latestProperties?.videoStreamingQuality;
       const { width, height } = this.streamService.getVideoDimensions(quality);
@@ -781,7 +780,23 @@ export class EufyDevice
         mediaStreamOptions: streamOptions,
       };
 
-      return await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+      // Scrypted cannot notify us when a consumer of an external RTSP URL
+      // disconnects. Activated sessions use a local, connection-owned endpoint
+      // that copies both codecs unchanged and releases NAS activation on close.
+      if (this.latestProperties?.rtspStream) {
+        const stream = await this.directRtspService.createVideoStream(rtspUrl);
+        ffmpegInput.url = stream.url;
+        ffmpegInput.inputArguments = stream.inputArguments;
+        streamOptions.container = "mpegts";
+        try {
+          return await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+        } catch (error) {
+          stream.close();
+          throw error;
+        }
+      }
+
+      return sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
     }
 
     const quality = this.latestProperties?.videoStreamingQuality;
@@ -818,6 +833,7 @@ export class EufyDevice
    * Delegates to the snapshot service which handles stream capture and JPEG conversion
    */
   async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+    await this.propertiesLoaded;
     const rtspUrl = this.getResolvedRtspUrl();
     if (rtspUrl) {
       const cached = this.streamServer.getCachedKeyframe(10_000);
@@ -825,22 +841,13 @@ export class EufyDevice
         return this.snapshotService.takePicture(options);
       }
       try {
-        const ffmpegInput: FFmpegInput = {
-          inputArguments: [
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            rtspUrl,
-            "-vframes",
-            "1",
-            "-f",
-            "image2",
-          ],
-        };
-        return await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+        const jpeg = await this.directRtspService.captureSnapshot(
+          rtspUrl,
+          options?.timeout,
+        );
+        return await sdk.mediaManager.createMediaObject(jpeg, "image/jpeg", {
+          sourceId: this.serialNumber,
+        });
       } catch (e) {
         this.logger.debug(`RTSP snapshot fallback to snapshotService: ${e}`);
       }
@@ -1629,6 +1636,11 @@ export class EufyDevice
    * Clean up resources on disposal
    */
   dispose(): void {
+    this.directRtspService
+      .dispose()
+      .catch((e: unknown) =>
+        this.logger.warn(`Error disposing direct RTSP service: ${e}`),
+      );
     if (this.talkbackProcess) {
       this.talkbackProcess.kill();
       this.talkbackProcess = undefined;

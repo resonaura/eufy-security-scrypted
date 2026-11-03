@@ -15,17 +15,24 @@ import {
   DEVICE_EVENTS,
   EufyWebSocketClient,
 } from "@caplaz/eufy-security-client";
+import { spawn } from "child_process";
+import { EventEmitter, once } from "events";
+import { createConnection, Socket } from "net";
+import { PassThrough } from "stream";
 
 const mockCreateFFmpegMediaObject = jest.fn();
+const mockCreateMediaObject = jest.fn();
+const JPEG = Buffer.from([0xff, 0xd8, 1, 2, 3, 0xff, 0xd9]);
+
+jest.mock("child_process", () => ({ spawn: jest.fn() }));
 
 jest.mock("@scrypted/sdk", () => {
   const mediaManager = {
     convertMediaObjectToJSON: jest.fn(),
     createFFmpegMediaObject: (...args: any[]) =>
       mockCreateFFmpegMediaObject(...args),
-    createMediaObject: jest
-      .fn()
-      .mockImplementation((obj, mime, opts) => ({ obj, mime, opts })),
+    createMediaObject: (...args: any[]) => mockCreateMediaObject(...args),
+    getFFmpegPath: jest.fn().mockResolvedValue("/scrypted/ffmpeg"),
   };
   return {
     __esModule: true,
@@ -113,15 +120,42 @@ const makeLogger = (): any => {
   return sub;
 };
 
+async function settle() {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
+function makeChild() {
+  return Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: jest.fn(),
+  });
+}
+
 describe("EufyDevice Direct RTSP Streaming", () => {
   let device: EufyDevice;
   let mockApi: any;
   let mockWsClient: any;
+  let children: ReturnType<typeof makeChild>[];
+  let sockets: Socket[];
   const eventListeners: Record<string, Function[]> = {};
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockCreateFFmpegMediaObject.mockResolvedValue({ mediaObject: true });
+    mockCreateMediaObject.mockImplementation((obj, mime, opts) => ({
+      obj,
+      mime,
+      opts,
+    }));
+    children = [];
+    sockets = [];
+    (spawn as jest.Mock).mockImplementation(() => {
+      const child = makeChild();
+      children.push(child);
+      return child;
+    });
 
     eventListeners[DEVICE_EVENTS.PROPERTY_CHANGED] = [];
     eventListeners[DEVICE_EVENTS.GOT_RTSP_URL] = [];
@@ -141,6 +175,9 @@ describe("EufyDevice Direct RTSP Streaming", () => {
       isLivestreaming: jest.fn().mockResolvedValue({ livestreaming: false }),
       startLivestream: jest.fn().mockResolvedValue(undefined),
       stopLivestream: jest.fn().mockResolvedValue(undefined),
+      isRtspLivestreaming: jest
+        .fn()
+        .mockResolvedValue({ livestreaming: false }),
       startRtspLivestream: jest.fn().mockResolvedValue(undefined),
       stopRtspLivestream: jest.fn().mockResolvedValue(undefined),
       setProperty: jest.fn().mockResolvedValue(undefined),
@@ -167,9 +204,27 @@ describe("EufyDevice Direct RTSP Streaming", () => {
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    sockets.forEach((socket) => socket.destroy());
     device.dispose();
+    await (device as any).directRtspService.dispose();
+    jest.useRealTimers();
   });
+
+  async function consumeStream() {
+    const spawnCount = (spawn as jest.Mock).mock.calls.length;
+    const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
+    const url = new URL(callArg.url);
+    const socket = createConnection(Number(url.port), url.hostname);
+    sockets.push(socket);
+    socket.on("error", () => undefined);
+    await once(socket, "connect");
+    for (let i = 0; i < 100; i++) {
+      if ((spawn as jest.Mock).mock.calls.length > spawnCount) return socket;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    throw new Error("RTSP consumer did not attach");
+  }
 
   describe("Auto-detected RTSP", () => {
     it("advertises direct RTSP stream option when rtspStreamUrl property is present", async () => {
@@ -178,7 +233,7 @@ describe("EufyDevice Direct RTSP Streaming", () => {
       expect(options[0]).toEqual({
         id: "rtsp",
         name: "RTSP Stream (Direct)",
-        container: "rtsp",
+        container: "mpegts",
         tool: "ffmpeg",
         video: { codec: "h264", width: 1920, height: 1080 },
         audio: { codec: "aac" },
@@ -189,12 +244,28 @@ describe("EufyDevice Direct RTSP Streaming", () => {
       await device.getVideoStream();
       expect(mockCreateFFmpegMediaObject).toHaveBeenCalledTimes(1);
       const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
-      expect(callArg.url).toBe("rtsp://192.168.4.22/live0");
-      expect(callArg.inputArguments).toContain("-rtsp_transport");
-      expect(callArg.inputArguments).toContain("tcp");
-      expect(callArg.inputArguments).toContain("rtsp://192.168.4.22/live0");
+      expect(callArg.url).toMatch(/^tcp:\/\/127\.0\.0\.1:\d+$/);
+      expect(callArg.inputArguments).toEqual([
+        "-f",
+        "mpegts",
+        "-i",
+        callArg.url,
+      ]);
       expect(callArg.mediaStreamOptions.id).toBe("rtsp");
+      expect(callArg.mediaStreamOptions.container).toBe("mpegts");
       expect(callArg.mediaStreamOptions.audio.codec).toBe("aac");
+      expect(mockApi.startRtspLivestream).toHaveBeenCalledTimes(1);
+      await consumeStream();
+      expect(spawn).toHaveBeenCalledWith(
+        "/scrypted/ffmpeg",
+        expect.arrayContaining([
+          "-rtsp_transport",
+          "tcp",
+          "rtsp://192.168.4.22/live0",
+          "-c",
+          "copy",
+        ]),
+      );
     });
 
     it("falls back to P2P stream when explicit p2p stream id is requested", async () => {
@@ -203,6 +274,45 @@ describe("EufyDevice Direct RTSP Streaming", () => {
       const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
       expect(callArg.url).toBeUndefined();
       expect(callArg.inputArguments).toContain("tcp://127.0.0.1:8080");
+      expect(mockApi.startRtspLivestream).not.toHaveBeenCalled();
+    });
+
+    it("keeps a direct RTSP descriptor for sources without NAS activation", async () => {
+      await device.getVideoStreamOptions();
+      (device as any).latestProperties.rtspStream = false;
+      await device.getVideoStream({ id: "rtsp" });
+      const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
+      expect(callArg.url).toBe("rtsp://192.168.4.22/live0");
+      expect(callArg.inputArguments).toEqual(
+        expect.arrayContaining(["-rtsp_transport", "tcp", callArg.url]),
+      );
+      expect(callArg.mediaStreamOptions.container).toBe("rtsp");
+      expect(mockApi.isRtspLivestreaming).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it("uses P2P when no RTSP URL is available", async () => {
+      await device.getVideoStreamOptions();
+      (device as any).latestProperties.rtspStreamUrl = "";
+      const options = await device.getVideoStreamOptions();
+      expect(options.some((option) => option.id === "rtsp")).toBe(false);
+      await device.getVideoStream();
+      expect(
+        mockCreateFFmpegMediaObject.mock.calls[0][0].inputArguments,
+      ).toContain("tcp://127.0.0.1:8080");
+      expect(mockApi.startRtspLivestream).not.toHaveBeenCalled();
+    });
+
+    it("releases activation if creating the media descriptor fails", async () => {
+      mockCreateFFmpegMediaObject.mockRejectedValueOnce(
+        new Error("descriptor failed"),
+      );
+      await expect(device.getVideoStream()).rejects.toThrow(
+        "descriptor failed",
+      );
+      await settle();
+      expect(mockApi.stopRtspLivestream).toHaveBeenCalledTimes(1);
+      expect(spawn).not.toHaveBeenCalled();
     });
   });
 
@@ -217,9 +327,8 @@ describe("EufyDevice Direct RTSP Streaming", () => {
       expect(resolved).toBe("rtsp://admin:secret123@192.168.4.99/live0");
 
       await device.getVideoStream();
-      const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
-      expect(callArg.url).toBe("rtsp://admin:secret123@192.168.4.99/live0");
-      expect(callArg.inputArguments).toContain(
+      await consumeStream();
+      expect((spawn as jest.Mock).mock.calls[0][1]).toContain(
         "rtsp://admin:secret123@192.168.4.99/live0",
       );
     });
@@ -264,14 +373,117 @@ describe("EufyDevice Direct RTSP Streaming", () => {
   });
 
   describe("Snapshot with RTSP", () => {
-    it("captures snapshot from RTSP stream via FFmpeg when available and no keyframe cached", async () => {
-      await device.takePicture();
-      expect(mockCreateFFmpegMediaObject).toHaveBeenCalledTimes(1);
-      const callArg = mockCreateFFmpegMediaObject.mock.calls[0][0];
-      expect(callArg.inputArguments).toContain("-rtsp_transport");
-      expect(callArg.inputArguments).toContain("tcp");
-      expect(callArg.inputArguments).toContain("-vframes");
-      expect(callArg.inputArguments).toContain("1");
+    it("activates and awaits real JPEG capture instead of returning a descriptor", async () => {
+      const picture = device.takePicture();
+      await settle();
+      expect(mockApi.startRtspLivestream).toHaveBeenCalledTimes(1);
+      expect(mockCreateFFmpegMediaObject).not.toHaveBeenCalled();
+      expect(mockCreateMediaObject).not.toHaveBeenCalled();
+      expect((spawn as jest.Mock).mock.calls[0][1]).toEqual(
+        expect.arrayContaining([
+          "-rtsp_transport",
+          "tcp",
+          "rtsp://192.168.4.22/live0",
+          "-frames:v",
+          "1",
+        ]),
+      );
+      children[0].stdout.write(JPEG);
+      children[0].emit("close", 0);
+      await expect(picture).resolves.toEqual({
+        obj: JPEG,
+        mime: "image/jpeg",
+        opts: { sourceId: "TEST_RTSP_CAMERA" },
+      });
+      await settle();
+      expect(mockApi.stopRtspLivestream).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses SnapshotService after a real RTSP capture failure", async () => {
+      const options = { timeout: 1000 };
+      const fallback = { fallback: true };
+      const takePicture = jest
+        .spyOn((device as any).snapshotService, "takePicture")
+        .mockResolvedValue(fallback);
+      const picture = device.takePicture(options);
+      await settle();
+      children[0].emit("close", 1);
+      await expect(picture).resolves.toBe(fallback);
+      expect(takePicture).toHaveBeenCalledTimes(1);
+      expect(takePicture).toHaveBeenCalledWith(options);
+      expect(children[0].kill).toHaveBeenCalledWith("SIGKILL");
+      await settle();
+      expect(mockApi.stopRtspLivestream).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back promptly on capture timeout and releases activation", async () => {
+      jest.useFakeTimers();
+      const fallback = { fallback: true };
+      const takePicture = jest
+        .spyOn((device as any).snapshotService, "takePicture")
+        .mockResolvedValue(fallback);
+      const picture = device.takePicture({ timeout: 50 });
+      await settle();
+      await jest.advanceTimersByTimeAsync(50);
+      await expect(picture).resolves.toBe(fallback);
+      expect(takePicture).toHaveBeenCalledTimes(1);
+      expect(children[0].kill).toHaveBeenCalledWith("SIGKILL");
+      expect(mockApi.stopRtspLivestream).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back if activation fails without claiming ownership", async () => {
+      mockApi.startRtspLivestream.mockRejectedValueOnce(
+        new Error("camera asleep"),
+      );
+      const fallback = { fallback: true };
+      const takePicture = jest
+        .spyOn((device as any).snapshotService, "takePicture")
+        .mockResolvedValue(fallback);
+      await expect(device.takePicture()).resolves.toBe(fallback);
+      expect(takePicture).toHaveBeenCalledTimes(1);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(mockApi.stopRtspLivestream).not.toHaveBeenCalled();
+    });
+
+    it("uses a cached snapshot without activating RTSP", async () => {
+      (device as any).streamServer.getCachedKeyframe.mockReturnValue({
+        data: Buffer.from("cached keyframe"),
+        ageMs: 100,
+        codec: "H264",
+      });
+      const cached = { cached: true };
+      const takePicture = jest
+        .spyOn((device as any).snapshotService, "takePicture")
+        .mockResolvedValue(cached);
+      await expect(device.takePicture()).resolves.toBe(cached);
+      expect(takePicture).toHaveBeenCalledTimes(1);
+      expect(mockApi.isRtspLivestreaming).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it("waits for initial properties before selecting the cold snapshot source", async () => {
+      device.dispose();
+      await (device as any).directRtspService.dispose();
+      const properties = await mockApi.getProperties();
+      let resolveProperties!: (value: unknown) => void;
+      mockApi.getProperties.mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveProperties = resolve;
+        }),
+      );
+      device = new EufyDevice("TEST_RTSP_CAMERA", mockWsClient, makeLogger());
+      const picture = device.takePicture();
+      await settle();
+      expect(spawn).not.toHaveBeenCalled();
+      resolveProperties(properties);
+      await settle();
+      expect(mockApi.startRtspLivestream).toHaveBeenCalledTimes(1);
+      children[0].stdout.write(JPEG);
+      children[0].emit("close", 0);
+      await expect(picture).resolves.toMatchObject({
+        obj: JPEG,
+        mime: "image/jpeg",
+      });
     });
   });
 });
